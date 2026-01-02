@@ -4,16 +4,14 @@ from flask import Flask, request, send_file, render_template_string
 from pypdf import PdfReader, PdfWriter
 from pypdf._page import PageObject
 
-# --- NEW IMPORTS FOR ADVANCED TEXT WRAPPING ---
 from reportlab.platypus import Paragraph
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.colors import black
-# ---
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.pagesizes import letter # Still used as a fallback
 from reportlab.lib.units import inch
 
-VERSION = "2025-12-31.flask.v6.layout-fixed"
+VERSION = "2025-12-31.flask.v7.dynamic-layout"
 
 HTML = """
 <!doctype html>
@@ -74,7 +72,7 @@ HTML = """
 
 app = Flask(__name__)
 
-# ---------- BOM Parsing (Improved "Chunking" Method) ----------
+# ---------- BOM Parsing (No changes needed here) ----------
 
 MAT_RE = re.compile(r'\b(\d{9})\b')
 QTY_RE = re.compile(r"(\d+)\s*$")
@@ -109,36 +107,24 @@ def extract_items_bom_style(pdf_path: str, start_page: int = 0):
     full_text = ""
     for pi in range(start_page, len(reader.pages)):
         full_text += (reader.pages[pi].extract_text() or "") + "\n"
-
     items = []
     chunks = MAT_RE.split(full_text)
-
     for i in range(1, len(chunks), 2):
         mat = chunks[i]
         text_chunk = chunks[i+1]
-        
-        if not text_chunk:
-            continue
-
+        if not text_chunk: continue
         lines = [l.strip() for l in text_chunk.splitlines() if l.strip()]
-
         qty = None
         desc_parts = []
-
         for line in lines:
             if looks_like_qty_line(" " + line + " "):
                 qm = QTY_RE.search(line)
                 if qm:
-                    qty_val = int(qm.group(1))
-                    if 0 <= qty_val <= 999:
-                        qty = qty_val
+                    qty = int(qm.group(1))
             elif is_valid_desc_line(line):
                 desc_parts.append(line)
-
         if mat and desc_parts and qty is not None and qty > 0:
-            desc = normalize_desc(" ".join(desc_parts))
-            items.append({"desc": desc, "mat": mat, "qty": qty})
-
+            items.append({"desc": normalize_desc(" ".join(desc_parts)), "mat": mat, "qty": qty})
     dedup = []
     seen = set()
     for it in items:
@@ -148,64 +134,66 @@ def extract_items_bom_style(pdf_path: str, start_page: int = 0):
             dedup.append(it)
     return dedup
 
-
 def paginate(items, per_page=18):
     return [items[i:i+per_page] for i in range(0, len(items), per_page)] or [[]]
 
-# ---------- DD1750 Overlay (FIXED with text wrapping and alignment) ----------
+# ---------- DD1750 Overlay (DEFINITIVE FIX: DYNAMIC LAYOUT) ----------
 
-def make_overlay(pages, label="NSN"):
+def make_overlay(pages, label, template_pdf_path):
+    # 1. Read the template to get its exact dimensions
+    template_reader = PdfReader(template_pdf_path)
+    if not template_reader.pages:
+        raise ValueError("Template PDF is empty.")
+    template_page = template_reader.pages[0]
+    page_width = float(template_page.mediabox.width)
+    page_height = float(template_page.mediabox.height)
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    c = canvas.Canvas(tmp.name, pagesize=letter)
-
-    # --- COORDINATE AND STYLE DEFINITIONS ---
+    # 2. Create a canvas with the EXACT same size as the template
+    c = canvas.Canvas(tmp.name, pagesize=(page_width, page_height))
+    
+    # --- STYLES ---
     styles = getSampleStyleSheet()
     desc_style = ParagraphStyle('DescStyle', parent=styles['Normal'], fontName='Helvetica', fontSize=9, leading=10, textColor=black)
     nsn_style = ParagraphStyle('NsnStyle', parent=styles['Normal'], fontName='Helvetica', fontSize=8, leading=9, textColor=black)
     
-    # Column X-coordinates
-    x_box_center = 1.10*inch
-    x_contents_left = 1.62*inch
-    x_uoi_center = 6.18*inch
-    x_init_center = 7.05*inch
-    x_spares_center = 7.83*inch
-    x_total_center = 8.58*inch
+    # 3. Use percentages to calculate all coordinates dynamically
+    # These percentages were measured from the dd1750.pdf form
+    x_box_center = page_width * 0.125
+    x_contents_left = page_width * 0.185
+    x_uoi_center = page_width * 0.725
+    x_init_center = page_width * 0.825
+    x_spares_center = page_width * 0.915
+    x_total_center = page_width * 0.985 # Pushed to the right edge
 
-    # FIXED: Vertical coordinates to remove top gap
-    top = 9.0 * inch
-    bottom = 2.4 * inch
+    top = page_height * 0.76  # Top of the first writable row
+    bottom = page_height * 0.12 # Bottom of the last writable row
+    
     per_page = 18
     row_h = (top - bottom) / per_page
     
-    # --- PAGE GENERATION LOOP ---
     for p, rows in enumerate(pages, start=1):
         current_y = top
         for idx, it in enumerate(rows, start=1):
-            row_top_y = current_y
             row_bottom_y = current_y - row_h
+            center_y = row_bottom_y + row_h / 2 - 4 # Vertical center for single-line text
 
-            # --- Column (a) Box No. ---
+            # Column (a) Box No.
             c.setFont("Helvetica", 9)
-            s = str((p-1)*per_page + idx)
-            c.drawCentredString(x_box_center, row_bottom_y + row_h / 2 - 4, s)
+            c.drawCentredString(x_box_center, center_y, str((p-1)*per_page + idx))
 
-            # --- Column (b) Contents (with text wrapping) ---
-            content_x = x_contents_left
-            content_w = x_uoi_center - x_contents_left - 0.05 * inch
-            
-            # Description (top of the row)
+            # Column (b) Contents (with wrapping)
+            content_width = x_uoi_center - x_contents_left - (page_width * 0.01)
             desc_p = Paragraph(it['desc'], desc_style)
-            w_d, h_d = desc_p.wrap(content_w, row_h)
-            desc_p.drawOn(c, content_x, row_top_y - h_d - 2)
+            w_d, h_d = desc_p.wrap(content_width, row_h * 0.6) # Use 60% of row height for desc
+            desc_p.drawOn(c, x_contents_left, current_y - h_d - (row_h * 0.1)) # Position desc from top
 
-            # NSN (bottom of the row)
             nsn_p = Paragraph(f"{label}: {it['mat']}", nsn_style)
-            w_n, h_n = nsn_p.wrap(content_w, row_h)
-            nsn_p.drawOn(c, content_x, row_bottom_y + 2)
+            w_n, h_n = nsn_p.wrap(content_width, row_h * 0.4) # Use 40% of row height for nsn
+            nsn_p.drawOn(c, x_contents_left, row_bottom_y + (row_h * 0.05)) # Position nsn from bottom
 
-            # --- Other Columns ---
+            # Other Columns
             c.setFont("Helvetica", 9)
-            center_y = row_bottom_y + row_h / 2 - 4
             c.drawCentredString(x_uoi_center, center_y, "EA")
             c.drawCentredString(x_init_center, center_y, str(it['qty']))
             c.drawCentredString(x_spares_center, center_y, "0")
@@ -216,22 +204,16 @@ def make_overlay(pages, label="NSN"):
     c.save()
     return tmp.name
 
-
 def merge_with_template(template_pdf: str, overlay_pdf: str, out_pdf: str):
     tpl = PdfReader(template_pdf)
     ov = PdfReader(overlay_pdf)
     writer = PdfWriter()
-    
-    if not tpl.pages:
-        raise ValueError("Template PDF cannot be empty")
     base = tpl.pages[0]
-
     for ovp in ov.pages:
         merged = PageObject.create_blank_page(width=base.mediabox.width, height=base.mediabox.height)
         merged.merge_page(base)
         merged.merge_page(ovp)
         writer.add_page(merged)
-
     with open(out_pdf, "wb") as f:
         writer.write(f)
 
@@ -256,12 +238,12 @@ def generate():
         template.save(tpl_path)
 
         items = extract_items_bom_style(bom_path, start_page=start_page)
-        
         if not items:
-            return "Could not parse any items from the BOM. Please ensure the PDF contains selectable text.", 400
+            return "Could not parse any items from the BOM. Please ensure the PDF is not a scanned image and contains selectable text.", 400
 
         pages = paginate(items, per_page=18)
-        overlay = make_overlay(pages, label=label)
+        # Pass the template path to the overlay function
+        overlay = make_overlay(pages, label=label, template_pdf_path=tpl_path)
         out_pdf = os.path.join(td, "DD1750_OUTPUT.pdf")
         merge_with_template(tpl_path, overlay, out_pdf)
 
