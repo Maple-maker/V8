@@ -3,11 +3,17 @@ from flask import Flask, request, send_file, render_template_string
 
 from pypdf import PdfReader, PdfWriter
 from pypdf._page import PageObject
+
+# --- NEW IMPORTS FOR ADVANCED TEXT WRAPPING ---
+from reportlab.platypus import Paragraph
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.colors import black
+# ---
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 
-VERSION = "2025-12-31.flask.v4.fixed"
+VERSION = "2025-12-31.flask.v6.layout-fixed"
 
 HTML = """
 <!doctype html>
@@ -68,11 +74,10 @@ HTML = """
 
 app = Flask(__name__)
 
-# ---------- BOM parsing (BOM tables like your B49 style) ----------
+# ---------- BOM Parsing (Improved "Chunking" Method) ----------
 
-# More robust regexes that search for patterns within lines
-MAT_RE = re.compile(r"\b(\d{9})\b")  # Find 9-digit NIINs
-QTY_RE = re.compile(r"(\d+)\s*$")    # Find quantity at the end of a line
+MAT_RE = re.compile(r'\b(\d{9})\b')
+QTY_RE = re.compile(r"(\d+)\s*$")
 
 def looks_like_qty_line(s: str) -> bool:
     u = s.upper()
@@ -82,63 +87,57 @@ def is_header_noise(s: str) -> bool:
     u = s.upper()
     return any(h in u for h in [
         "LV", "DESCRIPTION", "WTY", "ARC", "CIIC", "UI", "SCMC", "AUTH", "OH QTY",
-        "COMPONENT OF END ITEM", "PAGE", "COEI", "IMAGE", "MATERIAL"
+        "COMPONENT OF END ITEM", "PAGE", "COEI", "IMAGE", "MATERIAL", "DATE:",
+        "PUB NUM:", "END ITEM NIIN:", "COMPONENT LISTING"
     ])
 
 def normalize_desc(s: str) -> str:
     s = re.sub(r"\s{2,}", " ", s).strip()
-    # keep only the real description text, strip trailing column junk if present
-    return s[:90]
+    return s
+
+def is_valid_desc_line(s: str) -> bool:
+    if not s or is_header_noise(s) or looks_like_qty_line(" " + s + " "):
+        return False
+    if ' ' not in s and ('~' in s or '_' in s or '-' in s):
+        return False
+    if re.fullmatch(r'[A-Z]', s):
+        return False
+    return True
 
 def extract_items_bom_style(pdf_path: str, start_page: int = 0):
     reader = PdfReader(pdf_path)
-    items = []
-    cur = {}
-
-    def flush():
-        nonlocal cur
-        if cur and "mat" in cur and "qty" in cur:
-            desc_lines = cur.get("desc", [])
-            desc = normalize_desc(" ".join(desc_lines))
-            desc = desc.replace(cur["mat"], "").strip()
-
-            if desc and cur["qty"] > 0:
-                final_item = {"desc": desc, "mat": cur["mat"], "qty": cur["qty"]}
-                items.append(final_item)
-        cur = {}
-
     full_text = ""
     for pi in range(start_page, len(reader.pages)):
-        txt = reader.pages[pi].extract_text() or ""
-        full_text += txt + "\n"
+        full_text += (reader.pages[pi].extract_text() or "") + "\n"
 
-    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
-    
-    for s in lines:
-        if is_header_noise(s):
+    items = []
+    chunks = MAT_RE.split(full_text)
+
+    for i in range(1, len(chunks), 2):
+        mat = chunks[i]
+        text_chunk = chunks[i+1]
+        
+        if not text_chunk:
             continue
 
-        mat_match = MAT_RE.search(s)
-        if mat_match:
-            flush()
-            cur = {"mat": mat_match.group(1), "desc": []}
-            s = MAT_RE.sub("", s).strip()
+        lines = [l.strip() for l in text_chunk.splitlines() if l.strip()]
 
-        if not cur:
-            continue
+        qty = None
+        desc_parts = []
 
-        if looks_like_qty_line(" " + s + " "):
-            qm = QTY_RE.search(s)
-            if qm:
-                qty = int(qm.group(1))
-                if 0 <= qty <= 999:
-                    cur["qty"] = qty
-            continue
+        for line in lines:
+            if looks_like_qty_line(" " + line + " "):
+                qm = QTY_RE.search(line)
+                if qm:
+                    qty_val = int(qm.group(1))
+                    if 0 <= qty_val <= 999:
+                        qty = qty_val
+            elif is_valid_desc_line(line):
+                desc_parts.append(line)
 
-        if s:
-            cur.setdefault("desc", []).append(s)
-
-    flush()
+        if mat and desc_parts and qty is not None and qty > 0:
+            desc = normalize_desc(" ".join(desc_parts))
+            items.append({"desc": desc, "mat": mat, "qty": qty})
 
     dedup = []
     seen = set()
@@ -149,59 +148,90 @@ def extract_items_bom_style(pdf_path: str, start_page: int = 0):
             dedup.append(it)
     return dedup
 
+
 def paginate(items, per_page=18):
     return [items[i:i+per_page] for i in range(0, len(items), per_page)] or [[]]
 
-# ---------- DD1750 overlay (align to template columns) ----------
+# ---------- DD1750 Overlay (FIXED with text wrapping and alignment) ----------
 
 def make_overlay(pages, label="NSN"):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     c = canvas.Canvas(tmp.name, pagesize=letter)
 
+    # --- COORDINATE AND STYLE DEFINITIONS ---
+    styles = getSampleStyleSheet()
+    desc_style = ParagraphStyle('DescStyle', parent=styles['Normal'], fontName='Helvetica', fontSize=9, leading=10, textColor=black)
+    nsn_style = ParagraphStyle('NsnStyle', parent=styles['Normal'], fontName='Helvetica', fontSize=8, leading=9, textColor=black)
+    
+    # Column X-coordinates
     x_box_center = 1.10*inch
     x_contents_left = 1.62*inch
     x_uoi_center = 6.18*inch
     x_init_center = 7.05*inch
     x_spares_center = 7.83*inch
     x_total_center = 8.58*inch
-    top = 6.55*inch
-    bottom = 1.06*inch
-    per_page = 18
-    row_h = (top-bottom)/per_page
 
+    # FIXED: Vertical coordinates to remove top gap
+    top = 9.0 * inch
+    bottom = 2.4 * inch
+    per_page = 18
+    row_h = (top - bottom) / per_page
+    
+    # --- PAGE GENERATION LOOP ---
     for p, rows in enumerate(pages, start=1):
-        y = top - row_h/2.0
+        current_y = top
         for idx, it in enumerate(rows, start=1):
-            line_no = (p-1)*per_page + idx
+            row_top_y = current_y
+            row_bottom_y = current_y - row_h
+
+            # --- Column (a) Box No. ---
             c.setFont("Helvetica", 9)
-            c.drawString(x_box_center - c.stringWidth(str(line_no),"Helvetica",9)/2, y-3, str(line_no))
+            s = str((p-1)*per_page + idx)
+            c.drawCentredString(x_box_center, row_bottom_y + row_h / 2 - 4, s)
+
+            # --- Column (b) Contents (with text wrapping) ---
+            content_x = x_contents_left
+            content_w = x_uoi_center - x_contents_left - 0.05 * inch
+            
+            # Description (top of the row)
+            desc_p = Paragraph(it['desc'], desc_style)
+            w_d, h_d = desc_p.wrap(content_w, row_h)
+            desc_p.drawOn(c, content_x, row_top_y - h_d - 2)
+
+            # NSN (bottom of the row)
+            nsn_p = Paragraph(f"{label}: {it['mat']}", nsn_style)
+            w_n, h_n = nsn_p.wrap(content_w, row_h)
+            nsn_p.drawOn(c, content_x, row_bottom_y + 2)
+
+            # --- Other Columns ---
             c.setFont("Helvetica", 9)
-            c.drawString(x_contents_left, y+2, it["desc"])
-            c.setFont("Helvetica", 8)
-            c.drawString(x_contents_left, y-10, f"{label}: {it['mat']}")
-            c.setFont("Helvetica", 9)
-            unit = "EA"
-            c.drawString(x_uoi_center - c.stringWidth(unit,"Helvetica",9)/2, y-3, unit)
-            q = str(it["qty"])
-            c.drawString(x_init_center - c.stringWidth(q,"Helvetica",9)/2, y-3, q)
-            z = "0"
-            c.drawString(x_spares_center - c.stringWidth(z,"Helvetica",9)/2, y-3, z)
-            c.drawString(x_total_center - c.stringWidth(q,"Helvetica",9)/2, y-3, q)
-            y -= row_h
+            center_y = row_bottom_y + row_h / 2 - 4
+            c.drawCentredString(x_uoi_center, center_y, "EA")
+            c.drawCentredString(x_init_center, center_y, str(it['qty']))
+            c.drawCentredString(x_spares_center, center_y, "0")
+            c.drawCentredString(x_total_center, center_y, str(it['qty']))
+            
+            current_y -= row_h
         c.showPage()
     c.save()
     return tmp.name
+
 
 def merge_with_template(template_pdf: str, overlay_pdf: str, out_pdf: str):
     tpl = PdfReader(template_pdf)
     ov = PdfReader(overlay_pdf)
     writer = PdfWriter()
+    
+    if not tpl.pages:
+        raise ValueError("Template PDF cannot be empty")
     base = tpl.pages[0]
+
     for ovp in ov.pages:
         merged = PageObject.create_blank_page(width=base.mediabox.width, height=base.mediabox.height)
         merged.merge_page(base)
         merged.merge_page(ovp)
         writer.add_page(merged)
+
     with open(out_pdf, "wb") as f:
         writer.write(f)
 
@@ -226,7 +256,10 @@ def generate():
         template.save(tpl_path)
 
         items = extract_items_bom_style(bom_path, start_page=start_page)
-        items = [it for it in items if int(it["qty"]) > 0]
+        
+        if not items:
+            return "Could not parse any items from the BOM. Please ensure the PDF contains selectable text.", 400
+
         pages = paginate(items, per_page=18)
         overlay = make_overlay(pages, label=label)
         out_pdf = os.path.join(td, "DD1750_OUTPUT.pdf")
